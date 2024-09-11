@@ -254,6 +254,10 @@ foreach ($folder in $showFolders) {
                 $searchResponse
             }
 
+            # Ensure $matchedShows is always an array
+            if ($matchedShows -isNot [array]) {
+                $matchedShows = @($matchedShows)  # Wrap single object in an array
+            }
             if ($matchedShows.Count -gt 0) {
                 $showId = $matchedShows[0].show.ids.trakt
                 $showProgress = Get-TraktShowProgress -accessToken $accessToken -showId $showId
