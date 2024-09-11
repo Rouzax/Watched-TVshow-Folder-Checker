@@ -264,18 +264,42 @@ foreach ($folder in $showFolders) {
 
                 # Track overall watched status
                 $overallWatchedStatus = $null
+                
+                # Initialize variables to track the highest fully watched season and detailed status
+                $highestFullyWatchedSeason = 0
+                $partialWatchedStatus = $null
+                $hasWatchedEpisodes = $false
+
                 foreach ($season in $showProgress.seasons) {
                     $totalEpisodes = $season.aired
                     $watchedEpisodes = $season.completed
 
                     if ($watchedEpisodes -gt 0) {
-                        if ($watchedEpisodes -lt $totalEpisodes) {
-                            $overallWatchedStatus = "Watched till Season $($season.number) Episode $watchedEpisodes of $totalEpisodes"
+                        $hasWatchedEpisodes = $true
+        
+                        if ($watchedEpisodes -eq $totalEpisodes) {
+                            # Season is fully watched
+                            $highestFullyWatchedSeason = [math]::Max($highestFullyWatchedSeason, $season.number)
                         } else {
-                            $overallWatchedStatus = "Fully Watched"
+                            # Track partial watched status
+                            $partialWatchedStatus = "Watched till Season $($season.number) Episode $watchedEpisodes of $totalEpisodes"
                         }
-                        # No need to break here as we want to process all seasons
                     }
+                }
+
+                # Determine overall watched status
+                if ($hasWatchedEpisodes) {
+                    if ($highestFullyWatchedSeason -eq $showProgress.seasons.Count) {
+                        $overallWatchedStatus = "Fully Watched"
+                    } else {
+                        if ($partialWatchedStatus) {
+                            $overallWatchedStatus = $partialWatchedStatus
+                        } else {
+                            $overallWatchedStatus = "Watched till Season $highestFullyWatchedSeason"
+                        }
+                    }
+                } else {
+                    $overallWatchedStatus = $null
                 }
 
                 # Output only if at least one episode was watched
