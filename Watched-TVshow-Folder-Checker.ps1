@@ -337,7 +337,7 @@ foreach ($folder in $showFolders) {
 }
 
 # Sort shows by LastWatchedDate (ascending)
-$sortedShows = $showsData | Sort-Object -Property LastWatchedDate
+$sortedShows = $showsData #| Sort-Object -Property LastWatchedDate
 
 # Output the sorted results with LastSeenDate
 foreach ($show in $sortedShows) {
