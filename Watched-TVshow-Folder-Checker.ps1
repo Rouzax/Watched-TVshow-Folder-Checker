@@ -235,8 +235,14 @@ foreach ($folder in $showFolders) {
         $showYear = $null
     }
 
+    $specialChars = @('+', '-', '&&', '||', '!', '(', ')', '{', '}', '[', ']', '^', '"', '~', '*', '?', ':', '/')
+    foreach ($char in $specialChars) {
+        $showTitle = $showTitle -replace [regex]::Escape($char), "`$char"
+    }
+
     # Lookup the show via Trakt API
-    $showSearchUrl = "https://api.trakt.tv/search/show?query=$showTitle"
+    $showTitleQuery = [System.Web.HttpUtility]::UrlEncode($showTitle)
+    $showSearchUrl = "https://api.trakt.tv/search/show?query=$showTitleQuery"
 
     try {
         $searchResponse = Invoke-RestMethod -Uri $showSearchUrl -Headers @{
