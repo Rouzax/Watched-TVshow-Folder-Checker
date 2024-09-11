@@ -225,6 +225,9 @@ $accessToken, $refreshToken, $clientId = Get-TraktAccessToken -clientId $clientI
 # Show Folder Processing
 $showFolders = Get-ChildItem -Path $rootFolder -Directory
 
+# Array to store show data
+$showsData = @()
+
 foreach ($folder in $showFolders) {
     $folderName = $folder.Name
     if ($folderName -match "(.+)\s\((\d{4})\)") {
@@ -270,7 +273,8 @@ foreach ($folder in $showFolders) {
 
                 # Track overall watched status
                 $overallWatchedStatus = $null
-                
+                $lastWatchedAt = $null
+
                 # Initialize variables to track the highest fully watched season and detailed status
                 $highestFullyWatchedSeason = 0
                 $partialWatchedStatus = $null
@@ -290,6 +294,13 @@ foreach ($folder in $showFolders) {
                             # Track partial watched status
                             $partialWatchedStatus = "Watched till Season $($season.number) Episode $watchedEpisodes of $totalEpisodes"
                         }
+
+                        # Find the latest watched episode date for sorting
+                        foreach ($episode in $season.episodes) {
+                            if ($episode.completed -and $episode.last_watched_at) {
+                                $lastWatchedAt = [datetime]$episode.last_watched_at
+                            }
+                        }
                     }
                 }
 
@@ -308,9 +319,13 @@ foreach ($folder in $showFolders) {
                     $overallWatchedStatus = $null
                 }
 
-                # Output only if at least one episode was watched
+                # Store show data only if at least one episode was watched
                 if ($overallWatchedStatus) {
-                    Write-Host "$folderName - $overallWatchedStatus"
+                    $showsData += [pscustomobject]@{
+                        FolderName      = $folderName
+                        WatchedStatus   = $overallWatchedStatus
+                        LastWatchedDate = $lastWatchedAt
+                    }
                 }
             } else {
                 Write-Error "No show found for '$showTitle' in year '$showYear'."
@@ -321,5 +336,13 @@ foreach ($folder in $showFolders) {
     }
 }
 
+# Sort shows by LastWatchedDate (ascending)
+$sortedShows = $showsData | Sort-Object -Property LastWatchedDate
+
+# Output the sorted results with LastSeenDate
+foreach ($show in $sortedShows) {
+    $lastWatchedDate = if ($show.LastWatchedDate) { $show.LastWatchedDate.ToString("yyyy-MM-dd") } else { "Unknown" }
+    Write-Host "$($show.FolderName) - $($show.WatchedStatus) - Last seen: $lastWatchedDate"
+}
 # Write-Host "Press any key to continue..."
 # $x = $host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
