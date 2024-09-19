@@ -216,6 +216,21 @@ function Get-TraktShowProgress {
     }
 }
 
+# Calculate folder size in GB and round it to 2 decimals
+function Get-FolderSizeInGB {
+    param (
+        [string]$folderPath
+    )
+
+    # Get the total size in bytes
+    $totalSizeBytes = (Get-ChildItem -Path $folderPath -Recurse -File | Measure-Object -Property Length -Sum).Sum
+
+    # Convert to GB (1 GB = 1,073,741,824 bytes) and round to 2 decimal places
+    $sizeInGB = [math]::Round($totalSizeBytes / 1GB, 2)
+
+    return $sizeInGB
+}
+
 # Token File Path
 $tokenFilePath = "$PSScriptRoot\tokens.json"
 
@@ -228,8 +243,22 @@ $showFolders = Get-ChildItem -Path $rootFolder -Directory
 # Array to store show data
 $showsData = @()
 
+# Total number of folders for progress calculation
+$totalFolders = $showFolders.Count
+$currentFolder = 0
+
 foreach ($folder in $showFolders) {
+    $currentFolder++
+    
+    # Update progress bar
+    Write-Progress -Activity "Processing TV Shows" -Status "$($currentFolder) of $($totalFolders) folders processed" `
+        -PercentComplete (($currentFolder / $totalFolders) * 100)
+
     $folderName = $folder.Name
+   
+    # Calculate folder size
+    $folderSizeGB = Get-FolderSizeInGB -folderPath $folder.FullName 
+
     if ($folderName -match "(.+)\s\((\d{4})\)") {
         $showTitle = $matches[1].Trim()
         $showYear = $matches[2]
@@ -323,6 +352,7 @@ foreach ($folder in $showFolders) {
                 if ($overallWatchedStatus) {
                     $showsData += [pscustomobject]@{
                         FolderName      = $folderName
+                        FolderSizeGB    = $folderSizeGB
                         WatchedStatus   = $overallWatchedStatus
                         LastWatchedDate = $lastWatchedAt
                     }
@@ -336,13 +366,9 @@ foreach ($folder in $showFolders) {
     }
 }
 
-# Sort shows by LastWatchedDate (ascending)
-$sortedShows = $showsData #| Sort-Object -Property LastWatchedDate
+# Sort shows by FolderSizeGB (descending)
+$sortedShows = $showsData | Sort-Object -Property FolderSizeGB -Descending
 
-# Output the sorted results with LastSeenDate
-foreach ($show in $sortedShows) {
-    $lastWatchedDate = if ($show.LastWatchedDate) { $show.LastWatchedDate.ToString("yyyy-MM-dd") } else { "Unknown" }
-    Write-Host "$($show.FolderName) - $($show.WatchedStatus) - Last seen: $lastWatchedDate"
-}
-# Write-Host "Press any key to continue..."
-# $x = $host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+# Display sorted results using Out-GridView
+$sortedShows | Out-GridView -Title "TV Shows Watched Status" -OutputMode None
+
