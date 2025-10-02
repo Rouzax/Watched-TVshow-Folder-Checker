@@ -163,24 +163,6 @@ The script recognizes many episode patterns:
 
 ---
 
-## 📜 License
-
-MIT License — feel free to use, modify, and share.
-(If you prefer a different license for your repo, update this section.)
-
----
-
-## 🤝 Contributing
-
-PRs welcome! Ideas that would be great to add:
-
-* Optional caching (title → Trakt ID)
-* Bulk watched map to reduce API calls
-* Parallel file enumeration (PS7)
-* Configurable extension list and exclusion patterns
-
----
-
 ## 🙌 Acknowledgements
 
 * [Trakt.tv](https://trakt.tv) for the API
