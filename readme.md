@@ -3,6 +3,7 @@
 Get a fast, sortable overview of the TV shows on your disk, cross-referenced with your **Trakt** watch history — so you can spot what’s **fully watched**, **partially watched**, or **unwatched**, and clean up space safely.
 
 The script opens an **Out-GridView** table with status, last watched date, and watched/unwatched disk usage per show.
+<img width="817" height="425" alt="image" src="https://github.com/user-attachments/assets/eb6830e9-01ab-49b9-a103-557b50807a6c" />
 
 ---
 
