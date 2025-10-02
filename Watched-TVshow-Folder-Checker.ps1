@@ -1,374 +1,655 @@
-<#
+<# 
 .SYNOPSIS
-    Main script to check watched TV shows using Trakt API.
+  Lists TV shows found under a root folder with Trakt watch status
+  and disk usage so you can clean up. Includes watched, partially watched,
+  and **unwatched** shows.
+
 .DESCRIPTION
-    This script interacts with the Trakt API to check the watched status 
-    of TV shows. It handles token authentication, token refreshing, and 
-    retrieves the progress of each show based on the information in the 
-    specified root folder. Shows are filtered to display only those with 
-    watched episodes.
+  - Uses Trakt OAuth (device-style “out of band” redirect URI).
+  - Caches access/refresh tokens to tokens.json next to the script.
+  - Automatically refreshes expired tokens and retries once on 401.
+  - Searches Trakt for each folder's show (prefers exact Title + Year match when available).
+  - Pulls watched progress per show; infers a friendly status (Fully Watched / Partially Watched / Unwatched).
+  - Totals the on-disk size:
+        * WatchedSizeGB  — sum of files matching watched SxxExx episodes
+        * TotalSizeGB    — all video files in the show folder
+        * UnwatchedSizeGB = Total - Watched
+  - Displays results in Out-GridView.
+
 .PARAMETER clientId
-    Client ID of the Trakt API application.
+  Trakt API Client ID. Optional if tokens.json already exists.
+  Get yours at: https://trakt.tv/oauth/applications
+
 .PARAMETER clientSecret
-    Client Secret of the Trakt API application.
+  Trakt API Client Secret. Optional if tokens.json already exists.
+
 .PARAMETER rootFolder
-    Root folder path where TV show directories are located.
-.INPUTS
-    None. The script processes directories based on the root folder path.
-.OUTPUTS
-    String output indicating the watched status of each show.
-.EXAMPLE
-    .\Check-WatchedShows.ps1 -clientId "yourClientId" -clientSecret "yourClientSecret" -rootFolder "C:\TVShows"
-    This example runs the script with the specified client ID, client secret, and root folder.
+  The root folder containing TV show folders, e.g. E:\Data\TVSeries\EN
+
+.NOTES
+  - Save as UTF-8 (no BOM) if you prefer (recommended).
+  - Be mindful of Trakt rate limits; a small delay is included between calls.
+  - Requires Windows PowerShell with Out-GridView (part of PowerShell ISE/RSAT) or PowerShell 7 + Microsoft.PowerShell.GraphicalTools module.
+
 #>
 
 param (
     [Parameter(Mandatory = $false)]
-    [string]$clientId, # Client ID of API for Trakt.tv
+    [string]$clientId,         # Trakt API Client ID
 
     [Parameter(Mandatory = $false)]
-    [string]$clientSecret, # Client Secret of API for Trakt.tv
+    [string]$clientSecret,     # Trakt API Client Secret
 
     [Parameter(Mandatory = $true)]
-    [string]$rootFolder    # Root folder to search for watched TV shows
+    [string]$rootFolder        # Root folder with TV show folders
 )
 
-<#
-.SYNOPSIS
-    Retrieves the Trakt access token from the token file or prompts for 
-    authorization if the token file does not exist.
-.DESCRIPTION
-    This function checks for an existing token file. If found, it reads 
-    and returns the access and refresh tokens. If the token file does not 
-    exist, it prompts the user to authorize the application and retrieves 
-    new tokens, saving them to the file.
-.INPUTS
-    None. The function reads tokens from a file or prompts for user input.
-.OUTPUTS
-    Tuple of strings representing the access and refresh tokens.
-.EXAMPLE
-    $accessToken, $refreshToken = Get-TraktAccessToken
-    This example retrieves the Trakt access and refresh tokens.
-#>
-function Get-TraktAccessToken {
-    param (
-        [string]$clientId,
-        [string]$clientSecret
+#region ----- Config & Globals -----
+
+# Where tokens are stored (next to this script)
+$script:tokenFilePath = Join-Path -Path $PSScriptRoot -ChildPath 'tokens.json'
+
+# Global bearer (updated on refresh)
+$script:accessToken = $null
+
+# Trakt constants
+$script:TraktApiVersion = '2'
+$script:RedirectUri = 'urn:ietf:wg:oauth:2.0:oob'
+$script:AuthUrlFmt = 'https://trakt.tv/oauth/authorize?response_type=code&client_id={0}&redirect_uri={1}'
+$script:TokenUrl = 'https://api.trakt.tv/oauth/token'
+$script:SearchShowUrl = 'https://api.trakt.tv/search/show?query={0}'
+$script:ShowProgressFmt = 'https://api.trakt.tv/shows/{0}/progress/watched?hidden=false&specials=false&count_specials=true'
+
+# API pacing (be gentle)
+$script:PerRequestDelayMs = 200
+
+# Video file extensions to count in sizes
+$script:VideoExtensions = @('.mkv', '.mp4', '.avi', '.mov', '.m4v', '.wmv')
+
+#endregion
+
+#region ----- Helpers -----
+
+function Save-Tokens {
+    param(
+        [Parameter(Mandatory)]
+        [string]$AccessToken,
+        [Parameter(Mandatory)]
+        [string]$RefreshToken,
+        [Parameter(Mandatory)]
+        [string]$ClientId,
+        [Parameter(Mandatory)]
+        [string]$ClientSecret
     )
-    if (Test-Path $tokenFilePath) {
-        $tokens = Get-Content $tokenFilePath | ConvertFrom-Json
-        return $tokens.access_token, $tokens.refresh_token, $tokens.client_Id
-    } else {
-        if (-not $clientId -or -not $clientSecret) {
-            $clientId = Read-Host "Enter your Trakt API Client ID"
-            $clientSecret = Read-Host "Enter your Trakt API Client Secret"
-        }
+    $tokens = [ordered]@{
+        access_token  = $AccessToken
+        refresh_token = $RefreshToken
+        client_id     = $ClientId
+        client_secret = $ClientSecret
+        saved_at_utc  = (Get-Date).ToUniversalTime().ToString('o')
+    }
+    $json = $tokens | ConvertTo-Json -Depth 5
+    $json | Set-Content -LiteralPath $script:tokenFilePath -Encoding UTF8
+}
 
-        $redirectUri = "urn:ietf:wg:oauth:2.0:oob"
-
-        $authUrl = "https://trakt.tv/oauth/authorize?response_type=code&client_id=$clientId&redirect_uri=$redirectUri"
-        Write-Host "Please visit the following URL to authorize the app:"
-        Write-Host $authUrl
-        
-        $authCode = Read-Host "Enter the authorization code provided by Trakt"
-        
-        $tokenUrl = "https://api.trakt.tv/oauth/token"
-        $tokenBody = @{
-            code          = $authCode
-            client_id     = $clientId
-            client_secret = $clientSecret
-            redirect_uri  = $redirectUri
-            grant_type    = "authorization_code"
-        }
-
-        try {
-            $tokenResponse = Invoke-RestMethod -Uri $tokenUrl -Method Post -Body ($tokenBody | ConvertTo-Json) -ContentType "application/json"
-            $accessToken = $tokenResponse.access_token
-            $refreshToken = $tokenResponse.refresh_token
-
-            # Save tokens to a file
-            $tokens = @{
-                access_token  = $accessToken
-                refresh_token = $refreshToken
-                client_Id     = $clientId
-                client_Secret = $clientSecret
-            }
-            $tokens | ConvertTo-Json | Set-Content $tokenFilePath
-
-            return $accessToken, $refreshToken, $clientId
-        } catch {
-            Write-Error "Failed to retrieve tokens. $_"
-            exit
-        }
+function Load-Tokens {
+    if (-not (Test-Path -LiteralPath $script:tokenFilePath)) {
+        return $null 
+    }
+    try {
+        return Get-Content -LiteralPath $script:tokenFilePath -Raw | ConvertFrom-Json
+    } catch {
+        Write-Warning "Could not read/parse tokens.json. You may need to authenticate again. Details: $_"
+        return $null
     }
 }
 
-<#
-.SYNOPSIS
-    Refreshes the Trakt access token using the refresh token.
-.DESCRIPTION
-    This function refreshes the Trakt access token using the provided 
-    refresh token. The new access and refresh tokens are saved to the token 
-    file.
-.INPUTS
-    None. The function uses the refresh token from the token file.
-.OUTPUTS
-    String representing the new access token.
-.EXAMPLE
-    $newAccessToken = Refresh-TraktAccessToken
-    This example refreshes the Trakt access token and retrieves the new token.
-#>
-function Refresh-TraktAccessToken {
-    param (
-        [string]$clientId,
-        [string]$clientSecret
+function Invoke-Trakt {
+    <#
+      .SYNOPSIS
+        Wrapper for Invoke-RestMethod with Trakt headers, 401 retry, and pacing.
+      .PARAMETER Uri
+        Target URI.
+      .PARAMETER Method
+        GET/POST (default GET).
+      .PARAMETER Body
+        Optional hashtable/body for POST.
+      .PARAMETER UseAuth
+        If true (default), adds Authorization header with current access token.
+    #>
+    param(
+        [Parameter(Mandatory)] [string]$Uri,
+        [ValidateSet('GET', 'POST')] [string]$Method = 'GET',
+        [object]$Body = $null,
+        [bool]$UseAuth = $true
     )
-    $tokens = Get-Content $tokenFilePath | ConvertFrom-Json
-    $refreshToken = $tokens.refresh_token
-    $clientId = $tokens.client_Id
-    $clientsecret = $tokens.client_secret
-    $redirectUri = "urn:ietf:wg:oauth:2.0:oob"
 
-    $refreshUrl = "https://api.trakt.tv/oauth/token"
-    $refreshBody = @{
-        refresh_token = $refreshToken
+    Start-Sleep -Milliseconds $script:PerRequestDelayMs
+
+    $headers = @{
+        'Content-Type'      = 'application/json'
+        'trakt-api-version' = $script:TraktApiVersion
+        'trakt-api-key'     = $clientId
+    }
+    if ($UseAuth -and $script:accessToken) {
+        $headers['Authorization'] = "Bearer $($script:accessToken)"
+    }
+
+    try {
+        if ($Method -eq 'POST') {
+            return Invoke-RestMethod -Uri $Uri -Method Post -Headers $headers `
+                -Body ($Body | ConvertTo-Json) -ErrorAction Stop
+        } else {
+            return Invoke-RestMethod -Uri $Uri -Method Get -Headers $headers -ErrorAction Stop
+        }
+    } catch {
+        $statusCode = $_.Exception.Response.StatusCode.Value__
+        if ($UseAuth -and $statusCode -eq 401) {
+            Write-Host "Access token expired or invalid. Refreshing token..."
+            $null = Refresh-TraktAccessToken
+            Start-Sleep -Milliseconds 150
+            if ($Method -eq 'POST') {
+                return Invoke-RestMethod -Uri $Uri -Method Post -Headers @{
+                    'Content-Type'      = 'application/json'
+                    'trakt-api-version' = $script:TraktApiVersion
+                    'trakt-api-key'     = $clientId
+                    'Authorization'     = "Bearer $($script:accessToken)"
+                } -Body ($Body | ConvertTo-Json) -ErrorAction Stop
+            } else {
+                return Invoke-RestMethod -Uri $Uri -Method Get -Headers @{
+                    'Content-Type'      = 'application/json'
+                    'trakt-api-version' = $script:TraktApiVersion
+                    'trakt-api-key'     = $clientId
+                    'Authorization'     = "Bearer $($script:accessToken)"
+                } -ErrorAction Stop
+            }
+        }
+        throw
+    }
+}
+
+#endregion
+
+#region ----- OAuth -----
+
+function Get-TraktAccessToken {
+    <#
+      .SYNOPSIS
+        Ensures we have an access token (and client creds) available.
+      .OUTPUTS
+        [void] — sets $script:accessToken and saves tokens.json as needed.
+    #>
+
+    $stored = Load-Tokens
+
+    if ($stored -and $stored.access_token -and $stored.refresh_token -and $stored.client_id -and $stored.client_secret) {
+        $script:accessToken = $stored.access_token
+        if (-not $clientId) {
+            $script:clientId = $stored.client_id 
+        } else {
+            $script:clientId = $clientId 
+        }
+        if (-not $clientSecret) {
+            $script:clientSecret = $stored.client_secret 
+        } else {
+            $script:clientSecret = $clientSecret 
+        }
+        return
+    }
+
+    if (-not $clientId -or -not $clientSecret) {
+        $clientId = Read-Host "Enter your Trakt API Client ID"
+        $clientSecret = Read-Host "Enter your Trakt API Client Secret"
+    }
+    $script:clientId = $clientId
+    $script:clientSecret = $clientSecret
+
+    $authUrl = [string]::Format($script:AuthUrlFmt, $clientId, [uri]::EscapeDataString($script:RedirectUri))
+    Write-Host "Please visit this URL to authorize the app, then paste the code below:`n$authUrl`n"
+
+    $authCode = Read-Host "Enter the authorization code provided by Trakt"
+
+    $tokenBody = @{
+        code          = $authCode
         client_id     = $clientId
         client_secret = $clientSecret
-        redirect_uri  = $redirectUri
-        grant_type    = "refresh_token"
+        redirect_uri  = $script:RedirectUri
+        grant_type    = 'authorization_code'
     }
 
     try {
-        $refreshResponse = Invoke-RestMethod -Uri $refreshUrl -Method Post -Body ($refreshBody | ConvertTo-Json) -ContentType "application/json"
-        $accessToken = $refreshResponse.access_token
-        $refreshToken = $refreshResponse.refresh_token
+        $resp = Invoke-Trakt -Uri $script:TokenUrl -Method POST -Body $tokenBody -UseAuth:$false
+        $script:accessToken = $resp.access_token
+        Save-Tokens -AccessToken $resp.access_token -RefreshToken $resp.refresh_token `
+            -ClientId $clientId -ClientSecret $clientSecret
+    } catch {
+        Write-Error "Failed to retrieve tokens. $_"
+        exit 1
+    }
+}
 
-        # Save updated tokens
-        $tokens.access_token = $accessToken
-        $tokens.refresh_token = $refreshToken
-        $tokens | ConvertTo-Json | Set-Content $tokenFilePath
+function Refresh-TraktAccessToken {
+    <#
+      .SYNOPSIS
+        Refreshes the access token using tokens.json and updates globals.
+      .OUTPUTS
+        [string] — the new access token.
+    #>
+    $stored = Load-Tokens
+    if (-not $stored) {
+        throw "No tokens.json available to refresh. Run the initial authorization first."
+    }
 
-        return $accessToken
+    $refreshBody = @{
+        refresh_token = $stored.refresh_token
+        client_id     = $stored.client_id
+        client_secret = $stored.client_secret
+        redirect_uri  = $script:RedirectUri
+        grant_type    = 'refresh_token'
+    }
+
+    try {
+        $resp = Invoke-Trakt -Uri $script:TokenUrl -Method POST -Body $refreshBody -UseAuth:$false
+        $script:accessToken = $resp.access_token
+        Save-Tokens -AccessToken $resp.access_token -RefreshToken $resp.refresh_token `
+            -ClientId $stored.client_id -ClientSecret $stored.client_secret
+        return $script:accessToken
     } catch {
         Write-Error "Failed to refresh tokens. $_"
-        exit
+        exit 1
     }
 }
 
-<#
-.SYNOPSIS
-    Retrieves the watched progress of a show from the Trakt API.
-.DESCRIPTION
-    This function retrieves the watched progress for a specific show by its 
-    Trakt ID. It handles token authentication and retries the request if 
-    the token has expired.
-.PARAMETER accessToken
-    The current access token for the Trakt API.
-.PARAMETER showId
-    The Trakt ID of the show to retrieve progress for.
-.INPUTS
-    None. The function uses the Trakt ID to request progress information.
-.OUTPUTS
-    Object representing the progress of the show.
-.EXAMPLE
-    $showProgress = Get-TraktShowProgress -accessToken $accessToken -showId 245
-    This example retrieves the watched progress for the show with ID 245.
-#>
-function Get-TraktShowProgress {
-    param (
-        [string]$accessToken,
-        [int]$showId
+#endregion
+
+#region ----- Trakt queries -----
+
+function Find-TraktShow {
+    <#
+      .SYNOPSIS
+        Searches Trakt for a show by title (and optional year) and returns the best match.
+      .PARAMETER Title
+        The show title (folder name, normalized).
+      .PARAMETER Year
+        Optional 4-digit year parsed from folder name.
+      .OUTPUTS
+        The chosen search result (with .show and .show.ids.trakt), or $null if none.
+    #>
+    param(
+        [Parameter(Mandatory)] [string]$Title,
+        [int]$Year
     )
 
-    $progressUrl = "https://api.trakt.tv/shows/$showId/progress/watched?hidden=false&specials=false&count_specials=true"
+    $encoded = [System.Web.HttpUtility]::UrlEncode($Title)
+    $uri = [string]::Format($script:SearchShowUrl, $encoded)
 
+    $results = $null
     try {
-        $response = Invoke-RestMethod -Uri $progressUrl -Headers @{
-            "Authorization"     = "Bearer $accessToken"
-            "Content-Type"      = "application/json"
-            "trakt-api-version" = "2"
-            "trakt-api-key"     = $clientId
-        }
-        return $response
+        $results = Invoke-Trakt -Uri $uri -Method GET
     } catch {
-        # Check if the token has expired (401 Unauthorized)
-        if ($_.Exception.Response.StatusCode -eq 401) {
-            Write-Host "Access token expired. Refreshing token..."
-            $newAccessToken = Refresh-TraktAccessToken
+        throw "Failed to search Trakt for '$Title'. $_"
+    }
 
-            # Retry the request with the refreshed token
-            try {
-                $response = Invoke-RestMethod -Uri $progressUrl -Headers @{
-                    "Authorization"     = "Bearer $newAccessToken"
-                    "Content-Type"      = "application/json"
-                    "trakt-api-version" = "2"
-                    "trakt-api-key"     = $clientId
-                }
-                return $response
-            } catch {
-                Write-Error "Failed to retrieve show progress after refreshing the token. $_"
-                exit
-            }
-        } else {
-            Write-Error "Failed to retrieve show progress. $_"
-            exit
+    if (-not $results) {
+        return $null 
+    }
+
+    $candidates = @($results)
+
+    if ($Year) {
+        $exact = $candidates | Where-Object { $_.show.title -eq $Title -and $_.show.year -eq $Year }
+        if ($exact) {
+            return $exact[0] 
+        }
+        $yearOnly = $candidates | Where-Object { $_.show.year -eq $Year }
+        if ($yearOnly) {
+            return $yearOnly[0] 
+        }
+    }
+
+    $titleOnly = $candidates | Where-Object { $_.show.title -eq $Title }
+    if ($titleOnly) {
+        return $titleOnly[0] 
+    }
+
+    return $candidates[0]
+}
+
+function Get-TraktShowProgress {
+    <#
+      .SYNOPSIS
+        Returns watched progress object for a trakt show id.
+      .PARAMETER TraktShowId
+        The numeric trakt show id.
+    #>
+    param(
+        [Parameter(Mandatory)] [int]$TraktShowId
+    )
+    $uri = [string]::Format($script:ShowProgressFmt, $TraktShowId)
+    try {
+        return Invoke-Trakt -Uri $uri -Method GET
+    } catch {
+        throw "Failed to retrieve show progress for trakt id $TraktShowId. $_"
+    }
+}
+
+#endregion
+
+#region ----- Folder & Size logic -----
+
+function Parse-FolderAsTitleYear {
+    <#
+      .SYNOPSIS
+        Parses a typical "Show Name (YYYY)" folder into Title + Year.
+      .OUTPUTS
+        [pscustomobject] with Title, Year (nullable)
+    #>
+    param(
+        [Parameter(Mandatory)] [string]$FolderName
+    )
+
+    if ($FolderName -match '^(?<title>.+?)\s\((?<year>\d{4})\)\s*$') {
+        return [pscustomobject]@{
+            Title = $matches['title'].Trim()
+            Year  = [int]$matches['year']
+        }
+    } else {
+        return [pscustomobject]@{
+            Title = $FolderName.Trim()
+            Year  = $null
         }
     }
 }
 
-# Calculate folder size in GB and round it to 2 decimals
-function Get-FolderSizeInGB {
-    param (
-        [string]$folderPath
+function Get-WatchedBytesForShow {
+    <#
+      .SYNOPSIS
+        Sum sizes of unique video files whose episode(s) are marked watched.
+        Handles multi-episode files like: S11E17E18, S11E17-E18, S11E17 E18, etc.
+      .PARAMETER ShowFolder
+        DirectoryInfo of the show folder.
+      .PARAMETER Seasons
+        The .seasons array from Trakt progress response (with .episodes etc.).
+      .OUTPUTS
+        [long] total bytes
+    #>
+    param(
+        [Parameter(Mandatory)] [System.IO.DirectoryInfo]$ShowFolder,
+        [Parameter(Mandatory)] $Seasons
     )
 
-    # Get the total size in bytes
-    $totalSizeBytes = (Get-ChildItem -Path $folderPath -Recurse -File | Measure-Object -Property Length -Sum).Sum
+    # Build a set of watched episode IDs like "S11E17"
+    $watchedSet = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($s in $Seasons) {
+        $sNum = [int]$s.number
+        foreach ($e in $s.episodes) {
+            if ($e.completed) {
+                $watchedSet.Add(("S{0:D2}E{1:D2}" -f $sNum, [int]$e.number)) | Out-Null
+            }
+        }
+    }
 
-    # Convert to GB (1 GB = 1,073,741,824 bytes) and round to 2 decimal places
-    $sizeInGB = [math]::Round($totalSizeBytes / 1GB, 2)
+    if ($watchedSet.Count -eq 0) {
+        return 0L 
+    }
 
-    return $sizeInGB
+    # Gather all video files once
+    $videoFiles = Get-ChildItem -Path $ShowFolder.FullName -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $script:VideoExtensions -contains $_.Extension.ToLower() }
+
+    if (-not $videoFiles) {
+        return 0L 
+    }
+
+    # Regex handles:
+    #   S11E17
+    #   S11E17E18
+    #   S11E17-E18
+    #   S11E17 E18
+    #   S11E17 - 18
+    $rx = [regex]'S(?<S>\d{1,2})E(?<E1>\d{2})(?:[-\.\s]*E?(?<E2>\d{2}))?'
+
+    $total = 0L
+    foreach ($file in $videoFiles) {
+        $name = $file.Name
+        $matches = $rx.Matches($name)
+        if ($matches.Count -eq 0) {
+            continue 
+        }
+
+        # Build the set of episode IDs this file represents
+        $fileEps = [System.Collections.Generic.HashSet[string]]::new()
+        foreach ($m in $matches) {
+            $sNum = [int]$m.Groups['S'].Value
+            $e1 = [int]$m.Groups['E1'].Value
+            $e2 = if ($m.Groups['E2'].Success) {
+                [int]$m.Groups['E2'].Value 
+            } else {
+                $null 
+            }
+
+            if ($e2 -and $e2 -ge $e1) {
+                foreach ($en in $e1..$e2) {
+                    $fileEps.Add(("S{0:D2}E{1:D2}" -f $sNum, $en)) | Out-Null
+                }
+            } else {
+                $fileEps.Add(("S{0:D2}E{1:D2}" -f $sNum, $e1)) | Out-Null
+            }
+        }
+
+        # Count the file once if ANY of its episodes are watched
+        $isWatchedFile = $false
+        foreach ($id in $fileEps) {
+            if ($watchedSet.Contains($id)) {
+                $isWatchedFile = $true; break 
+            }
+        }
+        if ($isWatchedFile) {
+            $total += $file.Length
+        }
+    }
+
+    return $total
 }
 
-# Token File Path
-$tokenFilePath = "$PSScriptRoot\tokens.json"
 
-# Check token and refresh if needed
-$accessToken, $refreshToken, $clientId = Get-TraktAccessToken -clientId $clientId -clientSecret $clientSecret
 
-# Show Folder Processing
-$showFolders = Get-ChildItem -Path $rootFolder -Directory
+function Get-TotalBytesForShow {
+    <#
+      .SYNOPSIS
+        Totals the sizes of *all* video files in the show folder (regardless of watched status).
+      .PARAMETER ShowFolder
+        DirectoryInfo of the show folder.
+      .OUTPUTS
+        [long] total bytes
+    #>
+    param(
+        [Parameter(Mandatory)] [System.IO.DirectoryInfo]$ShowFolder
+    )
 
-# Array to store show data
-$showsData = @()
+    $total = 0L
+    foreach ($ext in $script:VideoExtensions) {
+        $files = Get-ChildItem -Path $ShowFolder.FullName -Recurse -Include "*$ext" -File -ErrorAction SilentlyContinue
+        if ($files) {
+            $sum = ($files | Measure-Object -Property Length -Sum).Sum
+            if ($sum) {
+                $total += [int64]$sum 
+            }
+        }
+    }
+    return $total
+}
 
-# Total number of folders for progress calculation
-$totalFolders = $showFolders.Count
-$currentFolder = 0
+function Format-WatchedStatus {
+    <#
+      .SYNOPSIS
+        Builds a friendly status string from the progress object.
+      .OUTPUTS
+        [string]
+    #>
+    param(
+        [Parameter(Mandatory)] $Progress
+    )
+
+    if (-not $Progress -or -not $Progress.seasons) {
+        return 'Unwatched' 
+    }
+
+    $highestFull = 0
+    $partial = $null
+    $hasWatched = $false
+
+    foreach ($season in $Progress.seasons | Sort-Object number) {
+        $aired = [int]$season.aired
+        $complete = [int]$season.completed
+
+        if ($complete -gt 0) {
+            $hasWatched = $true
+            if ($aired -gt 0 -and $complete -eq $aired) {
+                if ([int]$season.number -gt $highestFull) {
+                    $highestFull = [int]$season.number
+                }
+            } else {
+                $partial = "Watched till Season $($season.number) Episode $complete of $aired"
+            }
+        }
+    }
+
+    if (-not $hasWatched) {
+        return 'Unwatched' 
+    }
+
+    $seasonCount = ($Progress.seasons | Measure-Object).Count
+    if ($highestFull -eq $seasonCount -and -not $partial) {
+        return 'Fully Watched'
+    }
+
+    if ($partial) {
+        return $partial 
+    }
+    if ($highestFull -gt 0) {
+        return "Watched till Season $highestFull" 
+    }
+    return 'Partially Watched'
+}
+
+#endregion
+
+#region ----- Main -----
+
+# Ensure we can authenticate
+Get-TraktAccessToken
+
+# Validate root folder
+if (-not (Test-Path -LiteralPath $rootFolder)) {
+    Write-Error "Root folder not found: $rootFolder"
+    exit 1
+}
+
+$showFolders = Get-ChildItem -LiteralPath $rootFolder -Directory -ErrorAction Stop
+if (-not $showFolders) {
+    Write-Warning "No subfolders found in '$rootFolder'."
+    return
+}
+
+$showsData = New-Object System.Collections.Generic.List[object]
+$total = $showFolders.Count
+$idx = 0
 
 foreach ($folder in $showFolders) {
-    $currentFolder++
-    
-    # Update progress bar
-    Write-Progress -Activity "Processing TV Shows" -Status "$($currentFolder) of $($totalFolders) folders processed" `
-        -PercentComplete (($currentFolder / $totalFolders) * 100)
+    $idx++
+    Write-Progress -Activity "Processing TV Shows" `
+        -Status "$idx of $total folders processed" `
+        -PercentComplete (([double]$idx / [double]$total) * 100)
 
-    $folderName = $folder.Name
-   
-    # Calculate folder size
-    $folderSizeGB = Get-FolderSizeInGB -folderPath $folder.FullName 
+    $parsed = Parse-FolderAsTitleYear -FolderName $folder.Name
+    $title = $parsed.Title
+    $year = $parsed.Year
 
-    if ($folderName -match "(.+)\s\((\d{4})\)") {
-        $showTitle = $matches[1].Trim()
-        $showYear = $matches[2]
-    } else {
-        $showTitle = $folderName
-        $showYear = $null
-    }
+    Write-Host ("Source Show Title:  {0}{1}" -f $title, $(if ($year) {
+                " ($year)" 
+            } else {
+                "" 
+            }))
 
-    $specialChars = @('+', '-', '&&', '||', '!', '(', ')', '{', '}', '[', ']', '^', '"', '~', '*', '?', ':', '/')
-    foreach ($char in $specialChars) {
-        $showTitle = $showTitle -replace [regex]::Escape($char), "`$char"
-    }
-
-    # Lookup the show via Trakt API
-    $showTitleQuery = [System.Web.HttpUtility]::UrlEncode($showTitle)
-    $showSearchUrl = "https://api.trakt.tv/search/show?query=$showTitleQuery"
+    $match = $null
+    $progress = $null
+    $status = 'Unknown'
+    $lastWatched = $null
 
     try {
-        $searchResponse = Invoke-RestMethod -Uri $showSearchUrl -Headers @{
-            "Authorization"     = "Bearer $accessToken"
-            "Content-Type"      = "application/json"
-            "trakt-api-version" = "2"
-            "trakt-api-key"     = $clientId
-        }
+        $match = Find-TraktShow -Title $title -Year $year
+        if ($match) {
+            Write-Host ("Trakt Show Title:   {0}" -f $match.show.title)
+            Write-Host ('-' * 66)
 
-        if ($searchResponse) {
-            # Filter the results based on the year if provided, otherwise take the first result
-            $matchedShows = if ($showYear) {
-                $searchResponse | Where-Object { $_.show.year -eq [int]$showYear }
-            } else {
-                $searchResponse
-            }
+            $progress = Get-TraktShowProgress -TraktShowId $match.show.ids.trakt
 
-            # Ensure $matchedShows is always an array
-            if ($matchedShows -isNot [array]) {
-                $matchedShows = @($matchedShows)  # Wrap single object in an array
-            }
-            if ($matchedShows.Count -gt 0) {
-                $showId = $matchedShows[0].show.ids.trakt
-                $showProgress = Get-TraktShowProgress -accessToken $accessToken -showId $showId
-
-                # Track overall watched status
-                $overallWatchedStatus = $null
-                $lastWatchedAt = $null
-
-                # Initialize variables to track the highest fully watched season and detailed status
-                $highestFullyWatchedSeason = 0
-                $partialWatchedStatus = $null
-                $hasWatchedEpisodes = $false
-
-                foreach ($season in $showProgress.seasons) {
-                    $totalEpisodes = $season.aired
-                    $watchedEpisodes = $season.completed
-
-                    if ($watchedEpisodes -gt 0) {
-                        $hasWatchedEpisodes = $true
-        
-                        if ($watchedEpisodes -eq $totalEpisodes) {
-                            # Season is fully watched
-                            $highestFullyWatchedSeason = [math]::Max($highestFullyWatchedSeason, $season.number)
-                        } else {
-                            # Track partial watched status
-                            $partialWatchedStatus = "Watched till Season $($season.number) Episode $watchedEpisodes of $totalEpisodes"
-                        }
-
-                        # Find the latest watched episode date for sorting
-                        foreach ($episode in $season.episodes) {
-                            if ($episode.completed -and $episode.last_watched_at) {
-                                $lastWatchedAt = [datetime]$episode.last_watched_at
-                            }
+            # Determine last watched timestamp across episodes
+            foreach ($s in $progress.seasons) {
+                foreach ($e in $s.episodes) {
+                    if ($e.completed -and $e.last_watched_at) {
+                        $dt = [datetime]$e.last_watched_at
+                        if (-not $lastWatched -or $dt -gt $lastWatched) {
+                            $lastWatched = $dt
                         }
                     }
                 }
-
-                # Determine overall watched status
-                if ($hasWatchedEpisodes) {
-                    if ($highestFullyWatchedSeason -eq $showProgress.seasons.Count) {
-                        $overallWatchedStatus = "Fully Watched"
-                    } else {
-                        if ($partialWatchedStatus) {
-                            $overallWatchedStatus = $partialWatchedStatus
-                        } else {
-                            $overallWatchedStatus = "Watched till Season $highestFullyWatchedSeason"
-                        }
-                    }
-                } else {
-                    $overallWatchedStatus = $null
-                }
-
-                # Store show data only if at least one episode was watched
-                if ($overallWatchedStatus) {
-                    $showsData += [pscustomobject]@{
-                        FolderName      = $folderName
-                        FolderSizeGB    = $folderSizeGB
-                        WatchedStatus   = $overallWatchedStatus
-                        LastWatchedDate = $lastWatchedAt
-                    }
-                }
-            } else {
-                Write-Error "No show found for '$showTitle' in year '$showYear'."
             }
+
+            $status = Format-WatchedStatus -Progress $progress
+        } else {
+            Write-Warning "No Trakt match found for '$title'."
+            $status = 'Unknown (no Trakt match)'
         }
     } catch {
-        Write-Error "Failed to search or process the show '$showTitle'. $_"
+        Write-Error "Failed to retrieve show information for $($folder.Name). $_"
+        # We still want to compute local sizes even if Trakt fails for this show
+        if (-not $status) {
+            $status = 'Unknown (error)' 
+        }
     }
+
+    # Sizes (always computed so we can include Unwatched / Unknown rows)
+    $totalBytes = Get-TotalBytesForShow -ShowFolder $folder
+    $watchedBytes = 0L
+    if ($progress -and $progress.seasons) {
+        $watchedBytes = Get-WatchedBytesForShow -ShowFolder $folder -Seasons $progress.seasons
+    }
+
+    if ($watchedBytes -gt $totalBytes) {
+        $watchedBytes = $totalBytes 
+    }
+
+    $totalGB = [math]::Round(($totalBytes / 1GB), 2)
+    $watchedGB = [math]::Round(($watchedBytes / 1GB), 2)
+    $unwatchedG = [math]::Round((([int64]$totalBytes - [int64]$watchedBytes) / 1GB), 2)
+    $pct = if ($totalBytes -gt 0) {
+        [math]::Round((100.0 * $watchedBytes / $totalBytes), 1) 
+    } else {
+        0 
+    }
+
+    $showsData.Add([pscustomobject]@{
+            Title           = $folder.Name
+            Status          = $status                         # Fully Watched / Partially Watched / Unwatched / Unknown
+            LastWatched     = $lastWatched
+            WatchedSizeGB   = $watchedGB
+            UnwatchedSizeGB = $unwatchedG
+            TotalSizeGB     = $totalGB
+            WatchedPct      = $pct
+        })
 }
 
-# Sort shows by FolderSizeGB (descending)
-$sortedShows = $showsData | Sort-Object -Property FolderSizeGB -Descending
+# Suggested sort: least recently watched first, then biggest total size
+$sorted = $showsData | Sort-Object @{Expression = 'LastWatched'; Ascending = $true }, @{Expression = 'TotalSizeGB'; Ascending = $false }
 
-# Display sorted results using Out-GridView
-$sortedShows | Out-GridView -Title "TV Shows Watched Status" -OutputMode None
+if ($sorted.Count -gt 0) {
+    # Use only ASCII in strings to avoid encoding-related parser issues
+    $sorted | Out-GridView -Title 'Shows (Trakt + Disk Usage) - Watched / Unwatched'
+} else {
+    Write-Host ("No shows found under '{0}'." -f $rootFolder)
+}
 
+
+#endregion
