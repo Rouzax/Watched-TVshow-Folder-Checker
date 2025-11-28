@@ -2,6 +2,8 @@
 
 A PowerShell script that cross-references your local TV show library with your Trakt.tv watch history to identify fully watched, partially watched, and unwatched content — helping you make informed decisions about disk space cleanup.
 
+<img width="1426" height="752" alt="image" src="https://github.com/user-attachments/assets/cdfae361-15bb-4c54-a7a8-858b00faf79b" />
+
 ## Features
 
 - **Trakt Integration** — OAuth authentication with automatic token refresh
