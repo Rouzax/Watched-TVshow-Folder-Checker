@@ -97,6 +97,7 @@
     Configuration is loaded from config.json if present. Command-line parameters override config values.
     Requires Windows PowerShell 5.1+ or PowerShell 7+ with Microsoft.PowerShell.GraphicalTools for GridView.
 #>
+#Requires -Version 5.1
 
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 param (
@@ -261,12 +262,18 @@ function Import-Configuration {
         try {
             $fileConfig = Get-Content -LiteralPath $script:Paths.Config -Raw | ConvertFrom-Json
 
-            if ($fileConfig.rootFolders) { $config.RootFolders = @($fileConfig.rootFolders) }
-            if ($fileConfig.excludePatterns) { $config.ExcludePatterns = @($fileConfig.excludePatterns) }
-            if ($fileConfig.cacheTTLHours) { $config.CacheTTLHours = [int]$fileConfig.cacheTTLHours }
-            if ($fileConfig.metadataTTLHours) { $config.MetadataTTLHours = [int]$fileConfig.metadataTTLHours }
-            if ($fileConfig.outputFormat) { $config.OutputFormat = $fileConfig.outputFormat }
-            if ($fileConfig.videoExtensions) { $config.VideoExtensions = @($fileConfig.videoExtensions) }
+            if ($null -ne $fileConfig.rootFolders) { $config.RootFolders = @($fileConfig.rootFolders) }
+            if ($null -ne $fileConfig.excludePatterns) { $config.ExcludePatterns = @($fileConfig.excludePatterns) }
+            if ($null -ne $fileConfig.cacheTTLHours) {
+                $parsed = 0; if ([int]::TryParse($fileConfig.cacheTTLHours, [ref]$parsed)) { $config.CacheTTLHours = $parsed }
+                else { Write-Warning "Invalid cacheTTLHours value '$($fileConfig.cacheTTLHours)' in config.json, using default" }
+            }
+            if ($null -ne $fileConfig.metadataTTLHours) {
+                $parsed = 0; if ([int]::TryParse($fileConfig.metadataTTLHours, [ref]$parsed)) { $config.MetadataTTLHours = $parsed }
+                else { Write-Warning "Invalid metadataTTLHours value '$($fileConfig.metadataTTLHours)' in config.json, using default" }
+            }
+            if ($null -ne $fileConfig.outputFormat) { $config.OutputFormat = $fileConfig.outputFormat }
+            if ($null -ne $fileConfig.videoExtensions) { $config.VideoExtensions = @($fileConfig.videoExtensions) }
             if ($fileConfig.clientId) { $config.ClientId = $fileConfig.clientId }
             if ($fileConfig.clientSecret) { $config.ClientSecret = $fileConfig.clientSecret }
 
@@ -396,8 +403,14 @@ function Initialize-TraktAuth {
         Write-Host ""
     }
 
-    $cid = if ($script:State.Config.ClientId) { $script:State.Config.ClientId } else { Read-Host "Enter your Trakt API Client ID" }
-    $csec = if ($script:State.Config.ClientSecret) { $script:State.Config.ClientSecret } else { Read-Host "Enter your Trakt API Client Secret" }
+    $cid = if ($script:State.Config.ClientId) { $script:State.Config.ClientId } else {
+        do { $input = Read-Host "Enter your Trakt API Client ID" } while ([string]::IsNullOrWhiteSpace($input))
+        $input
+    }
+    $csec = if ($script:State.Config.ClientSecret) { $script:State.Config.ClientSecret } else {
+        do { $input = Read-Host "Enter your Trakt API Client Secret" } while ([string]::IsNullOrWhiteSpace($input))
+        $input
+    }
 
     $script:State.ClientId = $cid
 
@@ -613,7 +626,7 @@ function Test-CacheValid {
     }
     $expiresAt = $cachedAt.AddHours($TTLHours)
 
-    return (Get-Date) -lt $expiresAt
+    return (Get-Date).ToUniversalTime() -lt $expiresAt
 }
 
 function Test-MetadataCacheValid {
@@ -636,7 +649,7 @@ function Test-MetadataCacheValid {
     if (-not $ttlHours) { $ttlHours = $script:Defaults.MetadataTTLHours }
 
     $expiresAt = $cachedAt.AddHours($ttlHours)
-    return (Get-Date) -lt $expiresAt
+    return (Get-Date).ToUniversalTime() -lt $expiresAt
 }
 
 function Get-CacheKey {
@@ -854,6 +867,7 @@ function Get-VideoFiles {
 
     $extensions = $script:State.Config.VideoExtensions
     if (-not $extensions) { $extensions = $script:Defaults.VideoExtensions }
+    $extensions = $extensions | ForEach-Object { $_.ToLowerInvariant() }
 
     $files = Get-ChildItem -Path $Folder.FullName -Recurse -File -ErrorAction SilentlyContinue |
         Where-Object { $extensions -contains $_.Extension.ToLowerInvariant() }
@@ -936,7 +950,7 @@ function Get-ShowSizeMetrics {
             $e1 = [int]$m.Groups['E1'].Value
             $e2 = if ($m.Groups['E2'].Success) { [int]$m.Groups['E2'].Value } else { $null }
 
-            if ($e2 -and $e2 -ge $e1) {
+            if ($e2 -and $e2 -ge $e1 -and ($e2 - $e1) -le 50) {
                 foreach ($en in $e1..$e2) {
                     $epId = "S{0:D2}E{1:D2}" -f $sNum, $en
                     $null = $fileEpisodes.Add($epId)
@@ -1096,13 +1110,7 @@ function Get-ShowData {
 
     $cacheKey = Get-CacheKey -FolderName $Folder.Name
     $parsed = ConvertFrom-FolderName -FolderName $Folder.Name
-    $displayTitle = if ($parsed.Year) {
-        $t = "{0} ({1})" -f $parsed.Title, $parsed.Year
-        $t
-    }
-    else {
-        $parsed.Title
-    }
+    $displayTitle = if ($parsed.Year) { "{0} ({1})" -f $parsed.Title, $parsed.Year } else { $parsed.Title }
 
     Write-Verbose "Processing: $displayTitle"
 
@@ -1202,38 +1210,29 @@ function Get-ShowData {
                     }
                 }
 
-                # Update cache with metadata - must rebuild as hashtable since JSON loads as PSCustomObject
-                $existingEntry = $Cache[$cacheKey]
+                # Update cache with metadata (skip if full fetch will rebuild everything below)
                 $nextEpStr = if ($nextEpisodeDate) { $nextEpisodeDate.ToString('o') } else { $null }
                 $metadataCachedAt = (Get-Date).ToUniversalTime().ToString('o')
 
-                if ($existingEntry) {
-                    # Rebuild existing entry as hashtable with new metadata
-                    $Cache[$cacheKey] = @{
-                        trakt_id           = $existingEntry.trakt_id
-                        trakt_slug         = $existingEntry.trakt_slug
-                        trakt_url          = $existingEntry.trakt_url
-                        status             = $existingEntry.status
-                        last_watched       = $existingEntry.last_watched
-                        progress_json      = $existingEntry.progress_json
-                        cached_at          = $existingEntry.cached_at
-                        total_bytes        = $currentTotalBytes
-                        folder_path        = $Folder.FullName
-                        series_status      = $seriesStatus
-                        network            = $network
-                        next_episode_date  = $nextEpStr
-                        metadata_cached_at = $metadataCachedAt
-                    }
-                }
-                else {
-                    # Create new entry
-                    $Cache[$cacheKey] = @{
-                        total_bytes        = $currentTotalBytes
-                        folder_path        = $Folder.FullName
-                        series_status      = $seriesStatus
-                        network            = $network
-                        next_episode_date  = $nextEpStr
-                        metadata_cached_at = $metadataCachedAt
+                if (-not $needsFetch) {
+                    $existingEntry = $Cache[$cacheKey]
+                    if ($existingEntry) {
+                        # Metadata-only refresh: rebuild existing entry as hashtable with new metadata
+                        $Cache[$cacheKey] = @{
+                            trakt_id           = $existingEntry.trakt_id
+                            trakt_slug         = $existingEntry.trakt_slug
+                            trakt_url          = $existingEntry.trakt_url
+                            status             = $existingEntry.status
+                            last_watched       = $existingEntry.last_watched
+                            progress_json      = $existingEntry.progress_json
+                            cached_at          = $existingEntry.cached_at
+                            total_bytes        = $currentTotalBytes
+                            folder_path        = $Folder.FullName
+                            series_status      = $seriesStatus
+                            network            = $network
+                            next_episode_date  = $nextEpStr
+                            metadata_cached_at = $metadataCachedAt
+                        }
                     }
                 }
             }
@@ -1513,7 +1512,11 @@ function Invoke-SeasonCleanup {
                         $null = New-Item -Path $archiveShowPath -ItemType Directory -Force
                     }
 
-                    Move-Item -LiteralPath $seasonPath -Destination $destination -Force
+                    if (Test-Path -LiteralPath $destination) {
+                        Write-Warning "  Skipped move (already exists at destination): $destination"
+                        continue
+                    }
+                    Move-Item -LiteralPath $seasonPath -Destination $destination
                     Write-Host "  Moved: $($season.DisplayName)" -ForegroundColor Green
                 }
                 elseif ($SkipRecycleBin) {
@@ -1555,7 +1558,7 @@ function Invoke-ShowCleanup {
     )
 
     $cleanedCount = 0
-    $cleanedSize = 0
+    $cleanedSize = 0.0
 
     foreach ($show in $Shows) {
         $folderPath = $show.FolderPath
@@ -1576,7 +1579,11 @@ function Invoke-ShowCleanup {
                     if (-not (Test-Path -LiteralPath $MoveToPath)) {
                         $null = New-Item -Path $MoveToPath -ItemType Directory -Force
                     }
-                    Move-Item -LiteralPath $folderPath -Destination $destination -Force
+                    if (Test-Path -LiteralPath $destination) {
+                        Write-Warning "  Skipped move (already exists at destination): $destination"
+                        continue
+                    }
+                    Move-Item -LiteralPath $folderPath -Destination $destination
                     Write-Host "  Moved: $($show.Title)" -ForegroundColor Green
                 }
                 elseif ($SkipRecycleBin) {
